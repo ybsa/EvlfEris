@@ -1,0 +1,18 @@
+torch>=2.0.0
+transformers>=4.35.0
+accelerate>=0.24.0
+bitsandbytes>=0.41.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+pyyaml>=6.0
+numpy>=1.24.0
+scipy>=1.10.0
+tqdm>=4.65.0
+einops>=0.7.0
+
+# Model Surgery Libraries
+baukit>=0.1.0  # For activation steering
+rome-kit>=0.1.0  # For knowledge editing (optional, we'll implement custom)
+
+# Optional: For advanced pruning
+torch-pruning>=1.3.0
