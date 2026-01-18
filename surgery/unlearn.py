@@ -1,45 +1,41 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import get_peft_model, LoraConfig, TaskType, PeftModel, prepare_model_for_kbit_training
 import yaml
 from pathlib import Path
 from tqdm import tqdm
-import copy
+import torch.nn.functional as F
+import random
 
-class Unlearner:
+class LoRAUnlearner:
     def __init__(self, config_path="configs/phase1.yaml", model_path="models/base"):
         self.model_path = model_path
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
         
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.masks = None
         
-        # Hardcoded Junk Data Generator (Celebrity/Viral/Horoscope)
-        # In a real scenario, we'd load a dataset.
+        # Datasets
         self.junk_data = [
-            "The latest celebrity scandal shocked the internet today when...",
-            "Top 10 reality TV moments that you won't believe...",
-            "According to your horoscope, today is a bad day for...",
-            "Viral dance trends are taking over social media...",
-            "The red carpet fashion fail that everyone is talking about...",
-            "Who is dating who? The ultimate relationship timeline...",
-            "The shocking truth about this influencer's diet...",
-            "Why this pop star is cancelling their tour...",
-            "The funniest cat videos of 2024...",
-            "What your zodiac sign says about your love life..."
-        ] * 10 # Repeat
-
-    def load_resources(self):
-        print(f"📦 Loading {self.model_path} (4-bit)...")
+            "The latest celebrity scandal shocked the internet today...",
+            "Top 10 reality TV moments of all time...",
+            "Your horoscope says you will find love soon...",
+            "This viral TikTok dance is taking over...",
+            "Fashion fails from the red carpet event...",
+            "Gossip about the famous pop star's breakup...",
+            "Click here to see the shocking photos...",
+            "Influencer apologizes for the controversy...",
+            "The secret diet of the supermodels revealed..."
+        ] * 10 
+        
+        self.retain_data = self.config['phase1']['calibration_data']['domain'] * 20
+        
+    def load_model(self):
+        print(f"📦 Loading {self.model_path} in 4-bit...")
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4",
-            # We need to potentially enable gradients, but 4bit standard layers don't support it easily.
-            # We will use a trick: Cast to float16 during the forward/backward loop for specific layers?
-            # Or use Peft? The user wants "Physical Update".
-            # For 4GB VRAM simplicity, we might emulate this or fail if unsupported.
-            # Attempting standard load first.
         )
         
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
@@ -52,72 +48,109 @@ class Unlearner:
             trust_remote_code=True
         )
         
-        # Enable gradients validation (this is where it gets tricky on 4bit)
-        # We might need to prepare_model_for_kbit_training(self.model)
-        from peft import prepare_model_for_kbit_training
+        # Prepare for kbit training (Crucial fix for "no grad" error)
         self.model = prepare_model_for_kbit_training(self.model)
         
-        print("✅ Model loaded.")
+        # Enable gradient checkpointing for memory efficiency
+        self.model.gradient_checkpointing_enable()
         
-        print("🎭 Loading Pruning Masks...")
-        if Path("pruning_masks.pt").exists():
-            self.masks = torch.load("pruning_masks.pt")
-            print(f"   Loaded masks for {len(self.masks)} layers.")
-        else:
-            print("⚠️ No masks found! Run prune.py first.")
-            self.masks = {}
+    def setup_lora(self):
+        print("🔧 Configuring LoRA Adapter for Unlearning...")
+        target_layers = self.config['phase1']['unlearning']['target_layers']
+        
+        # Transform layer indices to string suffixes if needed, or target all and filter?
+        # Standard LoRA targets module names. We can specify `layers_to_transform` in LoraConfig!
+        
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=self.config['phase1']['unlearning']['lora']['r'],
+            lora_alpha=self.config['phase1']['unlearning']['lora']['alpha'],
+            lora_dropout=self.config['phase1']['unlearning']['lora']['dropout'],
+            target_modules=["gate_proj", "up_proj", "down_proj"], # MLP only
+            layers_to_transform=target_layers # Targeted Layers 7-20
+        )
+        
+        self.model = get_peft_model(self.model, peft_config)
+        self.model.print_trainable_parameters()
+        
+    def get_batch(self, batch_size=2):
+        junk = random.sample(self.junk_data, k=batch_size)
+        retain = random.sample(self.retain_data, k=batch_size)
+        return junk, retain
 
-    def run_gradient_ascent(self):
-        print("📉 Starting Targeted Unlearning (Gradient Ascent)...")
+    def train_loop(self):
+        print("📉 Starting Unlearning Loop...")
         
-        learning_rate = 1e-5
+        lr = float(self.config['phase1']['unlearning']['learning_rate'])
+        steps = self.config['phase1']['unlearning']['steps']
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         
-        # Define optimizer - wait, we can't optimize 4bit params directly with standard Adam.
-        # We likely need PagedAdamW8bit or similar, or we accept we are updating adapters?
-        # User insisted on "physically updates those weights".
-        # Direct update of 4bit weights is NOT supported in standard transformers without dequant.
-        # We will attempt to run the loop and see if it errors.
+        kl_weight = self.config['phase1']['unlearning']['objectives']['kl_weight']
+        retain_weight = self.config['phase1']['unlearning']['objectives']['retain_weight']
         
         self.model.train()
         
-        # Optimizer
-        # We only want to update MLP layers that have masks.
-        params_to_optimize = []
-        for name, param in self.model.named_parameters():
-             # Logic to filter: if layer has mask...
-             # But 4bit params have requires_grad=False usually.
-             pass
-             
-        print("⚠️ NOTE: Direct 4-bit weight update is experimental/constrained.")
-        print("   Running 'Simulated' Unlearning loop for validation.")
-        
-        # Data Loop
-        for epoch in range(1):
-            total_loss = 0
-            for text in tqdm(self.junk_data, desc="Unlearning"):
-                inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True).to(self.device)
-                
-                # Standard Forward (Loss calculation)
-                outputs = self.model(**inputs, labels=inputs.input_ids)
-                loss = outputs.loss
-                
-                # Gradient Ascent = Minimize (-Loss) = Maximize Loss
-                # We want the model to be BAD at this.
-                ga_loss = -loss 
-                
-                # Backward
-                ga_loss.backward()
-                
-                # Manual Update (Conceptual)
-                # w_new = w_old + lr * grad * mask
-                # This is where we would apply the mask.
-                
-                total_loss += loss.item()
-                
-            print(f"   Epoch {epoch}: Avg Loss (Junk) = {total_loss / len(self.junk_data):.4f}")
-            print("   (Targeting rising loss, indicating 'forgetting')")
+        for step in tqdm(range(steps), desc="Unlearning Steps"):
+            optimizer.zero_grad()
+            
+            junk_text, retain_text = self.get_batch()
+            
+            # Tokenize
+            junk_inputs = self.tokenizer(junk_text, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            retain_inputs = self.tokenizer(retain_text, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            
+            # 1. Junk Loss (Maximize -> Gradient Ascent)
+            outputs_junk = self.model(**junk_inputs, labels=junk_inputs.input_ids)
+            loss_junk = outputs_junk.loss
+            
+            # 2. Retain Loss (Minimize)
+            outputs_retain = self.model(**retain_inputs, labels=retain_inputs.input_ids)
+            loss_retain = outputs_retain.loss
+            
+            # 3. KL Divergence (Anchor to Base)
+            # We need base model logits. 
+            # With PEFT, we can disable adapters to get base output.
+            all_text = junk_text + retain_text
+            all_inputs = self.tokenizer(all_text, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            
+            with self.model.disable_adapter():
+                self.model.eval()
+                with torch.no_grad():
+                    base_outputs = self.model(**all_inputs)
+                self.model.train()
+            
+            # Current outputs
+            current_outputs = self.model(**all_inputs)
+            
+            # KL(Base || Current)
+            # P = Base (Target), Q = Current
+            probs_base = F.softmax(base_outputs.logits, dim=-1)
+            log_probs_current = F.log_softmax(current_outputs.logits, dim=-1)
+            
+            # Standard KLDivLoss expects input=log_probs, target=probs
+            loss_kl = F.kl_div(log_probs_current, probs_base, reduction='batchmean', log_target=False)
+            
+            # Total Loss
+            # Goal: Maximize Junk Loss (Negative Gradient), Minimize Retain, Minimize KL
+            # Unlearning Loss = -Loss_Junk
+            # Total = -Loss_Junk + Alpha*Loss_Retain + Beta*KL
+            
+            total_loss = -loss_junk + (retain_weight * loss_retain) + (kl_weight * loss_kl)
+            
+            total_loss.backward()
+            optimizer.step()
+            
+            if step % 5 == 0:
+                print(f"   Step {step}: Total={total_loss.item():.4f} | Junk(Ascent)={loss_junk.item():.4f} | Retain={loss_retain.item():.4f} | KL={loss_kl.item():.4f}")
+
+        # Save Adapter
+        print("💾 Saving Unlearning Adapter...")
+        self.model.save_pretrained("models/unlearned_adapter")
+        print("✅ Done.")
 
 if __name__ == "__main__":
-    unlearner = Unlearner()
-    unlearner.load_resources()
-    unlearner.run_gradient_ascent()
+    unlearner = LoRAUnlearner()
+    unlearner.load_model()
+    unlearner.setup_lora()
+    unlearner.train_loop()
