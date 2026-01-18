@@ -1,6 +1,6 @@
 phase1:
   pruning:
-    method: "activation_based" # SparseGPT logic
+    method: "activation_based" 
     target_reduction: 0.20
     layers_scope: "middle"
     ignored_layers: [0, 1, 2, -3, -2, -1]
@@ -19,8 +19,18 @@ phase1:
     bnb_4bit_quant_type: "nf4"
 
   unlearning:
-    learning_rate: 1e-5
-    steps: 10
+    method: "lora_gradient_ascent"
+    learning_rate: 5.0e-6
+    steps: 50
+    target_layers: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    lora:
+      r: 8
+      alpha: 16
+      dropout: 0.05
+    objectives:
+      retain_ratio: 0.1 # 10% high quality data
+      kl_weight: 1.0    # Anchor to original model
+      retain_weight: 1.0 # Protect engineering knowledge
     junk_categories:
       - "celebrity gossip"
       - "reality tv updates"
